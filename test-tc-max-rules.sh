@@ -11,43 +11,22 @@ NIC2=${2:-ens5f1}
 my_dir="$(dirname "$0")"
 . $my_dir/common.sh
 
-reset_tc_nic $NIC
-reset_tc_nic $NIC2
 set -e
 
-title "Testing 8K skip_hw"
-reset_tc_nic $NIC
-sh $my_dir/tc_batch.sh 8192 skip_hw $NIC
-tc -b /tmp/tc_add_batch_8192 && success || fail
+for nic in $NIC $NIC2; do
+	# in case user has only one NIC
+	if [[ "$nic" == "NULL" ]]; then
+		continue
+	fi
+	for num in 8*1024 30*1024 64*1024; do
+		for skip in skip_hw skip_sw; do
+			for index in 0 1; do
+				title "Testing $num $skip $nic $index"
+				sh $my_dir/tc_batch.sh $num $skip $NIC $index \
+				    && success || fail
+			done
+		done
+	done
+done
 
-title "Testing 8K skip_sw"
-reset_tc_nic $NIC
-sh $my_dir/tc_batch.sh 8192 skip_sw $NIC
-tc -b /tmp/tc_add_batch_8192 && success || fail
-
-title "Testing 30K skip_sw per port"
-((count=30*1024))
-reset_tc_nic $NIC
-reset_tc_nic $NIC2
-title " - Add 30K to port 1"
-sh $my_dir/tc_batch.sh $count skip_sw $NIC
-tc -b /tmp/tc_add_batch_$count && success || fail
-title  " - Add 30K to port 2"
-sh $my_dir/tc_batch.sh $count skip_sw $NIC2
-tc -b /tmp/tc_add_batch_$count && success || fail
-title " - cleanup"
-reset_tc_nic $NIC
-reset_tc_nic $NIC2
-
-title "Testing 64K skip_hw"
-reset_tc_nic $NIC
-sh $my_dir/tc_batch.sh 65536 skip_hw $NIC
-tc -b /tmp/tc_add_batch_65536 && success || fail
-
-title "Testing 64K skip_sw"
-reset_tc_nic $NIC
-sh $my_dir/tc_batch.sh 65536 skip_sw $NIC
-tc -b /tmp/tc_add_batch_65536 && success || fail
-
-reset_tc_nic $NIC
 test_done
