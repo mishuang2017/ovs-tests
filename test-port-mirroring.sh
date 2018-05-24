@@ -3,39 +3,49 @@
 # Verify the port mirroring functionality
 #
 
-NIC=${1:-enp4s0f0}
+# local HV
+
+NIC=${1:-enp4s0f1}
 
 VF1=${2:-enp4s0f2}
 VF2=${3:-enp4s0f3}
 VF3=${4:-enp4s0f4}
 
-REP1=${5:-${NIC}_0}
+REP=${5:-${NIC}_0}	# mirror port
 REP2=${6:-${NIC}_1}
 REP3=${7:-${NIC}_2}
+
+# remote HV
+
+HOST2=""
+PASSWORD=""
+HOST2_NIC=${HOST2_NIC-enp4s0f0}
+
+HOST1_VXLAN=vxlan0
+BR=ov1
+NS1_IP=1.1.1.11		# IP address in namespace 1
+NS2_IP=1.1.1.12		# IP address in namespace 2
+HOST1_IP=192.168.1.14	# PF IP address of local HV
+HOST2_IP=192.168.1.13	# PF IP address of remote HV
+HOST2_VLAN_IP=1.1.1.1
+HOST2_VXLAN_IP=1.1.1.2
+HOST2_VXLAN=vxlan0
+
+TIMEOUT=${TIMEOUT:-80}
+ROUNDS=${ROUNDS:-2}
+VID=${VID-50}
+VNI=${VNI-100}
 
 my_dir="$(dirname "$0")"
 . $my_dir/common.sh
 
-NS1_IP=1.1.1.11
-NS2_IP=1.1.1.12
+if [[ -z "$HOST2" || -z "$PASSWORD" ]]; then
+    err "Please specify HOST2 and PASSWORD to run this test case"
+    exit 0
+fi
 
-BR=ov1
-HOST1_VXLAN=vxlan0
-HOST2_VXLAN=vxlan0
-
-HOST2_VLAN_IP=1.1.1.1
-HOST2_VXLAN_IP=1.1.1.2
-
-HOST2=${HOST2-10.12.205.14}
-HOST2_NIC=${HOST2_NIC-enp4s0}
-HOST1_IP=${HOST1_IP-192.168.1.13}
-HOST2_IP=${HOST2_IP-192.168.1.14}
-TIMEOUT=${TIMEOUT:-20}
-ROUNDS=${ROUNDS:-2}
-VID=${VID-50}
-VNI=${VNI-100}
-PASSWORD=${PASSWORD:-3tango}
-
+run_ping=1	# to ignore ping test, set it 0
+run_iperf=1	# to ignore iperf test, set it 0
 
 function cleanup() {
     del_all_bridges
@@ -76,12 +86,18 @@ function enable_sriov() {
 
 function verify_port_mirror() {
     for i in $(seq $ROUNDS); do
+        local t=$((TIMEOUT / ROUNDS / 2))
         title "- Enable port mirror"
         ovs-vsctl -- --id=@p get port $REP3 -- --id=@m create mirror name=m0 select-all=true output-port=@p -- set bridge $BR mirrors=@m
-        timeout 5 tcpdump ip -nnn -i $VF3
+	ping=1
+        if (( ping == 1 )); then
+            timeout $t tcpdump ip -nnn -i $VF3
+        else
+            sleep $t
+        fi
         title "- Disable port mirror"
         ovs-vsctl clear bridge $BR mirrors
-        timeout 5 tcpdump ip -nnn -i $VF3
+        timeout $t tcpdump ip -nnn -i $VF3
     done
 }
 
@@ -98,20 +114,28 @@ function cmd_on()
 
 function run_basic_test() {
     ovs-vsctl add-br $BR
-    ovs-vsctl add-port $BR $REP1
+    ovs-vsctl add-port $BR $REP
     ovs-vsctl add-port $BR $REP2
     ovs-vsctl add-port $BR $REP3
 
     title "Test ping $VF1($NS1_IP) -> $VF2($NS2_IP)"
 
-    ip netns exec ns0 ping -q -c 10 -i 0.2 -w 2 $NS2_IP && success || err "ping failed"
-    ip netns exec ns0 ping -q -c $TIMEOUT $NS2_IP &
-    verify_port_mirror
+    if (( run_ping == 1 )); then
+        ping=1
+        ip netns exec ns0 ping -q -c 10 -i 0.2 -w 2 $NS2_IP && success || err "ping failed"
+        ip netns exec ns0 ping -q -c $TIMEOUT $NS2_IP &
+        verify_port_mirror
+    fi
 
+    if (( run_iperf == 0 )); then
+        return
+    fi
+
+    ping=0
     title "Test iperf $VF1($NS1_IP) -> $VF2($NS2_IP)"
     timeout $TIMEOUT ip netns exec ns1 iperf3 -s --one-off -i 0 || err "iperf server failed" &
     sleep 1
-    timeout $TIMEOUT ip netns exec ns0 iperf3 -c $NS2_IP -t $((TIMEOUT-2)) -B $NS1_IP -P 100 --cport 6000 -i 0 || err "iperf client failed" &
+    timeout $TIMEOUT ip netns exec ns0 iperf3 -c $NS2_IP -t $((TIMEOUT-2)) -B $NS1_IP -P 10 --cport 6000 -i 0 || err "iperf client failed" &
     verify_port_mirror
 }
 
@@ -141,21 +165,29 @@ function run_vlan_test() {
     del_all_bridges
     ovs-vsctl add-br $BR
     ovs-vsctl add-port $BR $NIC
-    ovs-vsctl add-port $BR $REP1 tag=$VID
+    ovs-vsctl add-port $BR $REP tag=$VID
     ovs-vsctl add-port $BR $REP2 tag=$VID
     ovs-vsctl add-port $BR $REP3 tag=$VID
 
     config_remote_vlan $HOST2_NIC $VID $HOST2_VLAN_IP
 
-    title "Test ping $VF1($NS1_IP) -> remote vlan ($HOST2_VLAN_IP)"
+    if (( run_ping == 1 )); then
+        ping=1
+        title "Test ping $VF1($NS1_IP) -> remote vlan ($HOST2_VLAN_IP)"
+        ip netns exec ns0 ping -q -c $TIMEOUT $HOST2_VLAN_IP &
+        verify_port_mirror
+    fi
 
-    ip netns exec ns0 ping -q -c $TIMEOUT $HOST2_VLAN_IP &
-    verify_port_mirror
+    if (( run_iperf == 0 )); then
+        clear_remote_vlan
+        return
+    fi
 
+    ping=0
     cmd_on $HOST2 pkill iperf
     cmd_on $HOST2 timeout $TIMEOUT iperf3 -s --one-off -i 0 &
     sleep 1
-    timeout $TIMEOUT ip netns exec ns0 iperf3 -c $HOST2_VLAN_IP -t $((TIMEOUT-2)) -B $NS1_IP -P 100 --cport 6000 -i 0 &
+    timeout $TIMEOUT ip netns exec ns0 iperf3 -c $HOST2_VLAN_IP -t $((TIMEOUT-2)) -B $NS1_IP -P 10 --cport 6000 -i 0 &
     verify_port_mirror
 
     clear_remote_vlan
@@ -184,7 +216,7 @@ function run_vxlan_test() {
 
     del_all_bridges
     ovs-vsctl add-br $BR
-    ovs-vsctl add-port $BR $REP1
+    ovs-vsctl add-port $BR $REP
     ovs-vsctl add-port $BR $REP2
     ovs-vsctl add-port $BR $REP3
     ovs-vsctl add-port $BR $HOST1_VXLAN -- set interface $HOST1_VXLAN type=vxlan options:remote_ip=$HOST2_IP  options:key=$VNI
@@ -193,16 +225,23 @@ function run_vxlan_test() {
 
     config_remote_vxlan
 
-    title "Test ping $VF1($NS1_IP) -> remote vxlan ($HOST2_VXLAN_IP)"
+    if (( run_ping == 1 )); then
+        ping=1
+        title "Test ping $VF1($NS1_IP) -> remote vxlan ($HOST2_VXLAN_IP)"
+        ping -q -c 10 -i 0.2 -w 2 $HOST2_IP && success || err "ping failed"
+        ip netns exec ns0 ping -q -c $TIMEOUT $HOST2_VXLAN_IP &
+        verify_port_mirror
+    fi
 
-    ping -q -c 10 -i 0.2 -w 2 $HOST2_IP && success || err "ping failed"
-    ip netns exec ns0 ping -q -c $TIMEOUT $HOST2_VXLAN_IP &
-    verify_port_mirror
+    if (( run_iperf == 0 )); then
+        return
+    fi
 
+    ping=0
     cmd_on $HOST2 pkill iperf
     cmd_on $HOST2 timeout $TIMEOUT iperf3 -s --one-off -i 0 &
     sleep 1
-    timeout $TIMEOUT ip netns exec ns0 iperf3 -c $HOST2_VXLAN_IP -t $((TIMEOUT-2)) -B $NS1_IP -P 100 --cport 6000 -i 0 &
+    timeout $TIMEOUT ip netns exec ns0 iperf3 -c $HOST2_VXLAN_IP -t $((TIMEOUT-2)) -B $NS1_IP -P 10 --cport 6000 -i 0 &
     verify_port_mirror
 
     clear_remote_vxlan
@@ -213,14 +252,14 @@ function run_vxlan_test() {
 function config_header_rewrite() {
     ip netns exec ns0 ifconfig $VF1 192.168.0.2/24 up
     ip netns exec ns0 ip route add 8.9.10.0/24 via 192.168.0.1 dev $VF1
-    ifconfig $REP1 up
+    ifconfig $REP up
 
     ip netns exec ns1 ifconfig $VF2 8.9.10.11/24 up
     ifconfig $REP2 up
 
     del_all_bridges
     ovs-vsctl add-br $BR
-    ovs-vsctl add-port $BR $REP1 -- set Interface $REP1 ofport_request=2
+    ovs-vsctl add-port $BR $REP -- set Interface $REP ofport_request=2
     ovs-vsctl add-port $BR $REP2 -- set Interface $REP2 ofport_request=3
     ovs-vsctl add-port $BR $REP3 -- set Interface $REP3 ofport_request=4
 
@@ -239,14 +278,22 @@ function config_header_rewrite() {
 function run_header_rewrite_test() {
     config_header_rewrite
 
-    title "Test ping $VF1(192.168.0.2) -> $VF2 (8.9.10.11)"
-    ip netns exec ns0 ping -q -c $TIMEOUT 8.9.10.11 &
-    verify_port_mirror
+    if (( run_ping == 1 )); then
+        ping=1
+        title "Test ping $VF1(192.168.0.2) -> $VF2 (8.9.10.11)"
+        ip netns exec ns0 ping -q -c $TIMEOUT 8.9.10.11 &
+        verify_port_mirror
+    fi
 
+    if (( run_iperf == 0 )); then
+        return
+    fi
+
+    ping=0
     title "Test iperf $VF1(192.168.0.2) -> $VF2(8.9.10.11)"
     timeout $TIMEOUT ip netns exec ns1 iperf3 -s --one-off -i 0 || err "iperf server failed" &
     sleep 1
-    timeout $TIMEOUT ip netns exec ns0 iperf3 -c 8.9.10.11 -t $((TIMEOUT-2)) -B 192.168.0.2 -P 100 --cport 6000 -i 0 || err "iperf client failed" &
+    timeout $TIMEOUT ip netns exec ns0 iperf3 -c 8.9.10.11 -t $((TIMEOUT-2)) -B 192.168.0.2 -P 10 --cport 6000 -i 0 || err "iperf client failed" &
     verify_port_mirror
 }
 
@@ -262,7 +309,7 @@ bind_vfs $NIC
 . $my_dir/set-macs.sh $NIC 3
 
 start_clean_openvswitch
-config_vf ns0 $VF1 $REP1 $NS1_IP
+config_vf ns0 $VF1 $REP $NS1_IP
 config_vf ns1 $VF2 $REP2 $NS2_IP
 ifconfig $VF3 up
 ifconfig $REP3 up
